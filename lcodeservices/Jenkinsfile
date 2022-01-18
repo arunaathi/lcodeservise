@@ -1,0 +1,181 @@
+#!/usr/bin/env groovy
+
+def now = new Date()
+def current_timestamp = now.format("yyyyMMddHHmmss", TimeZone.getTimeZone('UTC'))
+env.BUILD_NUMBER = current_timestamp
+echo "BUILD_NUMBER : '${env.BUILD_NUMBER}'"
+
+def vRepoName = null
+def vBranchName = null
+def vBuildNumber = null
+node('linux') {
+
+	def jdkHome
+	def mvnHome
+   
+	vBuildNumber =      "$BUILD_NUMBER"
+    vRepoName =         "${env.JOB_NAME}".split('/')[1]
+    vBranchName =       "${env.JOB_NAME}".split('/')[2]
+            
+	def gitShortCommitID = null
+	def sonarqube_pretag = "lcodeservice-bld${BUILD_NUMBER}"
+    def destLocation = "maven-snapshot/com/lcode/services/${vRepoName}/${vBranchName}/b${vBuildNumber}"
+            
+    stage('Source') {
+        checkout scm
+		gitShortCommitID = gitCommitShortHash()
+        notifyStash()
+    }
+	
+	    // Prepare the build environment 
+    stage('Build environment') {
+        jdkHome = installTool "jdk-11.0.2"
+        mvnHome = installTool "apache-maven-3.5.2"
+		println "###################################################################################"
+  
+  		println "   REPO_NAME             :$vRepoName"
+  		println "	BRANCH_NAME			  :$vBranchName"
+  		println "	BUILD_NUMBER		  :$vBuildNumber"
+  		
+  		println "###################################################################################"
+    }
+    
+	stage('Compile') {
+        catchError {
+            withEnv(["JAVA_HOME=${jdkHome}", "MAVEN_HOME=${mvnHome}", "PATH+MAVEN=${mvnHome}/bin"]) {
+                artifactoryMaven {
+                    goals = "clean compile"
+					deploy_artifacts=false
+                }
+            }
+            jacoco execPattern: '**/target/**.exec'
+        }
+		notifyStash()		
+    }
+            
+    // Compile the Code
+	stage('Package Jar'){
+  		withEnv(["JAVA_HOME=${jdkHome}", "MAVEN_HOME=${mvnHome}", "PATH+MAVEN=${mvnHome}/bin"]) {
+	    	artifactoryMaven {
+	      		goals = '-X clean install'
+	      		deploy_artifacts = false
+	    	}
+  		}
+	}   
+
+	stage('Upload Jar to Artifactory') {
+        uploadToArtifactory {
+            pattern = "target/lcodeservice*.jar"
+            target = "${destLocation}"+ '/'
+        }
+        notifyStash()
+    }
+
+
+	stage('SonarQube') {
+        sonarQube {
+			version = "${sonarqube_pretag}-${gitShortCommitID}"
+			branch_wise_report='true'
+			code_sources = 'src/main/'
+			binary_location = 'target/'
+		}
+    }
+	stage('JUnit') {       
+        withEnv(["JAVA_HOME=${jdkHome}", "MAVEN_HOME=${mvnHome}", "PATH+MAVEN=${mvnHome}/bin"]) {
+            artifactoryMaven {
+                goals = 'surefire-report:report'
+				deploy_artifacts = false
+            }
+		}
+		junit('**/target/surefire-reports/TEST-*.xml')    			
+		publishHTML([
+			allowMissing: false, 
+			alwaysLinkToLastBuild: true, 
+			keepAll: true, 
+			reportDir: '.', 
+			reportFiles: 'target/site/surefire-report.html',
+			reportName: 'Unit Test Report'])
+			
+		publishHTML([
+            allowMissing: false, 
+            alwaysLinkToLastBuild: true, 
+            keepAll: true, 
+            reportDir: '.', 
+            reportFiles: 'target/site/jacoco/index.html', 
+            reportName: 'Jacoco Coverage Report (Lcode Service API Report)'])                                
+    }
+    // Run AppScan Analysis
+ stage('App Scan'){
+	appScan {
+		version = "${sonarqube_pretag}-${gitShortCommitID}"
+        code_sources = 'src/'
+        include_folder = "src"
+        exclude_folder = "src/test"
+        precompiled_classes="target/classes"               
+        report_type = 'zip'
+		}
+        publishHTML([
+			allowMissing: false, 
+			alwaysLinkToLastBuild: true, 
+			keepAll: true, 
+			reportDir: '.', 
+			reportFiles: '.jenkinsvx_tmp/.appscan/Lcode..otherservices.html', 
+			reportName: 'Lcode Analysis Report'
+		])                    
+    }
+	
+	nexusScan("target/lcodeservice*.jar")
+            
+    stage('Pipeline stash repo') {
+        stash name: 'source-repo'
+    }
+}
+    
+
+//Build agent with Docker capability
+node('docker') {
+
+	vBranchName = "${vBranchName}".toLowerCase()
+	//Unstash previously stashed source from another build agent
+	stage('Clean workspace and unstash source') {
+		deleteDir()
+		unstash 'source-repo'
+	}
+
+    //Specify the Docker registry where your image will be pushed to
+    //Current Docker registry in PROD is in Artifactory
+    //Refer to https://go.cloudbees.com/docs/cloudbees-documentation/cje-user-guide/index.html#docker-workflow for more docker build steps
+    artifactoryDockerRegistry {
+        stage('Build Docker image') {
+            dir("${WORKSPACE}") {
+                def srcBuild = docker.build("lcode/lcodeservice-${vBranchName}:b${vBuildNumber}",
+                                "--build-arg https_proxy=http://10.192.116.73:8080 " +
+                                "--build-arg http_proxy=http://10.192.116.73:8080 " +                                
+                                "--build-arg REPO_NAME=${vRepoName} " +
+                                "--build-arg BUILD_VERSION=${vBranchName} " +
+                                "--build-arg BUILD_NUMBER=b${vBuildNumber} " +
+                                "--build-arg BRANCH_NAME=${vBranchName} " +                      
+								".")
+                                                        
+                //Push your image to Docker registry, defaults to Artifactory
+                srcBuild.push()
+			}
+        }
+    }
+	notifyStash()    
+}
+node('notary') {
+    //Run AquaScan on docker image
+    stage('Aqua Scan') {
+        def imageName = "????/lcode/lcodeservice-${vBranchName}".toLowerCase()
+        sh("docker pull ${imageName}:b${vBuildNumber} --disable-content-trust")
+        scContainerBuild {
+          NO_BUILD = "true"
+          DOCKER_IMAGE_NAME = "${imageName}"
+          DOCKER_IMAGE_VERSION = "b${vBuildNumber}"
+          DOCKER_FILE = "Dockerfile"
+        }
+    }
+    currentBuild.result = "SUCCESS"
+    notifyBitbucket()
+}

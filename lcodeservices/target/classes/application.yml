@@ -1,0 +1,55 @@
+server:
+   port: 8091      
+   servlet:
+        context-path: /lcodeservices   
+spring:
+   application:
+      name: lcodedataservice
+   jpa:
+      database-platform: org.hibernate.dialect.PostgreSQLDialect
+      show-sql: true
+   datasource: 
+      type: com.zaxxer.hikari.HikariDataSource  
+      hikari:
+        minimumIdle: 10
+        maximumPoolSize: 10
+        maxLifetime : 3600000
+        pool-name:   lcodedataservice
+        connection-test-query:  select 1 from customer
+      driver-class-name: org.postgresql.Driver
+      url: jdbc:postgresql://localhost:5432/lcodedb
+      username: postgres
+      password: admin
+      main:
+        allow-bean-definition-overriding: true
+eureka: 
+  client: 
+    register-with-eureka: true
+    fetch-registry: true
+    service-url: 
+      defaultZone: http://localhost:8092/eureka
+      healthcheck: 
+        enabled: true
+  instance:
+    leaseExpirationDurationInSeconds: 2      
+  server:
+      wait-time-in-ms-when-sync-empty: 0       
+      
+            
+
+info:
+   app:
+      name: lcodedataservice Application
+   version: 1.0.0
+   
+limits:
+  - default:
+      memory: 1Gi
+    defaultRequest:
+      memory: 1Gi
+    max:
+      memory: 1Gi
+    min:
+      memory: 500Mi
+    type: Container
+     
